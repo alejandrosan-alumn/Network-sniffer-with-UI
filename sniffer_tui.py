@@ -4,7 +4,7 @@ import threading
 import subprocess
 from datetime import datetime
 
-# --- AUTO-INSTALACION ---
+# --- AUTO-INSTALACION DE DEPENDENCIAS ---
 def verificar_dependencias():
     librerias = ["textual", "scapy", "psutil"]
     for lib in librerias:
@@ -20,7 +20,7 @@ from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, RichLog, Label, Button, ListItem, ListView
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from scapy.all import sniff, IP, Ether
+from scapy.all import sniff, IP, Ether, TCP, UDP, ICMP
 
 # --- VENTANA EMERGENTE PARA DETALLES ---
 class DetalleIPScreen(ModalScreen):
@@ -45,11 +45,10 @@ class DetalleIPScreen(ModalScreen):
 
 # --- APLICACION PRINCIPAL ---
 class SnifferTUI(App):
-    # CSS LIMPIO: Sin font-size ni text-size para evitar errores
     CSS = """
     Screen { layout: horizontal; }
-    #sidebar { width: 35%; border-right: tall $primary; background: $surface; }
-    #main_content { width: 65%; }
+    #sidebar { width: 30%; border-right: tall $primary; background: $surface; }
+    #main_content { width: 70%; }
     .title { text-align: center; background: $primary; color: white; text-style: bold; padding: 1; }
     #controls { height: auto; border-top: solid $primary; padding: 1; align: center middle; }
     Button { margin: 1; width: 15; }
@@ -76,7 +75,7 @@ class SnifferTUI(App):
                 yield Label(" DISPOSITIVOS (Click) ", classes="title")
                 yield ListView(id="device_list")
             with Vertical(id="main_content"):
-                yield Label(" AUDITORIA EN TIEMPO REAL ", classes="title")
+                yield Label(" IDS & MONITOR DE ACTIVIDAD ", classes="title")
                 yield RichLog(id="event_log", highlight=True, markup=True)
                 with Horizontal(id="controls"):
                     yield Button("START", id="start", variant="success")
@@ -88,6 +87,7 @@ class SnifferTUI(App):
         self.sniffer_activo = False 
         self.seen_ips = {}
         self.selected_interface = None
+        self.connection_attempts = {} # Para el IDS
         
         iface_list = self.query_one("#iface_list")
         for iface in psutil.net_if_addrs().keys():
@@ -99,7 +99,6 @@ class SnifferTUI(App):
         if event.list_view.id == "iface_list":
             self.selected_interface = event.item.id
         elif event.list_view.id == "device_list":
-            # Busqueda de la IP asociada al widget clickeado
             target_ip = None
             for ip, data in self.seen_ips.items():
                 if data["widget"] == event.item.children[0]:
@@ -107,34 +106,65 @@ class SnifferTUI(App):
                     break
             
             if target_ip:
-                info = self.seen_ips[target_ip].get("nmap", "Escaneando...")
+                info = self.seen_ips[target_ip].get("nmap", "Analisis en curso...")
                 self.push_screen(DetalleIPScreen(target_ip, info))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "start" and self.selected_interface:
             if not self.sniffer_activo:
                 self.sniffer_activo = True
-                self.log_widget.write("[bold green]START: ESCANEO INICIADO[/bold green]")
+                self.log_widget.write("[bold green]SISTEMA DE MONITOREO E IDS ACTIVADO[/bold green]")
                 threading.Thread(target=self.run_sniffer, daemon=True).start()
         elif event.button.id == "stop":
             self.sniffer_activo = False
-            self.log_widget.write("[bold yellow]STOP: DETENIDO[/bold yellow]")
+            self.log_widget.write("[bold yellow]STOP: SISTEMA DETENIDO[/bold yellow]")
 
     def run_sniffer(self):
         def packet_callback(pkt):
             if not self.sniffer_activo: return True 
+            
             if IP in pkt:
                 ip_src = pkt[IP].src
+                ip_dst = pkt[IP].dst
+                
+                # --- 1. DESCUBRIMIENTO DE DISPOSITIVOS ---
                 if ip_src not in self.seen_ips:
-                    # Fabricante simplificado para evitar errores de importacion
                     nuevo_label = Label(f"IP: {ip_src} [bold yellow](...)[/]")
-                    self.seen_ips[ip_src] = {
-                        "nmap": "Ejecutando analisis de puertos críticos...", 
-                        "widget": nuevo_label
-                    }
-                    
+                    self.seen_ips[ip_src] = {"nmap": "Ejecutando analisis Nmap...", "widget": nuevo_label}
                     self.call_from_thread(self.add_device_to_list, nuevo_label)
                     threading.Thread(target=self.scan_ports_background, args=(ip_src,), daemon=True).start()
+
+                # --- 2. MONITOR DE ACTIVIDAD GENERAL (Flujo constante) ---
+                proto_name = "IP"
+                if pkt.haslayer(TCP): proto_name = "TCP"
+                elif pkt.haslayer(UDP): proto_name = "UDP"
+                elif pkt.haslayer(ICMP): proto_name = "ICMP"
+                
+                msg = f"[{proto_name}] {ip_src} -> {ip_dst}"
+
+                # --- 3. RESALTADO DE SEGURIDAD (IDS & Eventos Críticos) ---
+                # Detección de Handshake TCP
+                if pkt.haslayer(TCP) and pkt[TCP].flags == "S":
+                    msg = f"[bold cyan][CONEXIÓN][/] {ip_src} solicita puerto {pkt[TCP].dport}"
+                
+                # Detección de DNS
+                elif pkt.haslayer(UDP) and pkt[UDP].dport == 53:
+                    msg = f"[bold magenta][DNS][/] {ip_src} buscando resolución de nombre"
+
+                # Lógica IDS: Detección de Escaneo de Puertos
+                if pkt.haslayer(TCP) or pkt.haslayer(UDP):
+                    dport = pkt[TCP].dport if pkt.haslayer(TCP) else pkt[UDP].dport
+                    if ip_src not in self.connection_attempts:
+                        self.connection_attempts[ip_src] = set()
+                    
+                    self.connection_attempts[ip_src].add(dport)
+                    
+                    if len(self.connection_attempts[ip_src]) > 15:
+                        msg = f"[bold red blink][ALERTA IDS][/] ESCANEO DE PUERTOS detectado desde {ip_src}!"
+
+                # Enviar al log de la interfaz
+                if msg:
+                    self.call_from_thread(self.log_widget.write, msg)
 
         sniff(iface=self.selected_interface, prn=packet_callback, store=0, stop_filter=lambda x: not self.sniffer_activo)
 
@@ -143,7 +173,6 @@ class SnifferTUI(App):
 
     def scan_ports_background(self, ip: str):
         try:
-            # Los 20 puertos mas comunes y vulnerables
             puertos = "21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1723,3306,3389,5900,8080"
             cmd = ["nmap", "-sV", "-O", "-p", puertos, "--open", ip]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=80)
@@ -160,7 +189,7 @@ class SnifferTUI(App):
             elif "apple" in os_info: color = "yellow"
             elif "android" in os_info: color = "green"
 
-            self.seen_ips[ip]["nmap"] = f"[bold {color}]REPORTE PARA {ip}[/]\n\n{res.stdout}"
+            self.seen_ips[ip]["nmap"] = f"[bold {color}]REPORTE DE SEGURIDAD - {ip}[/]\n\n{res.stdout}"
             self.call_from_thread(self.update_ui_finished, ip, color)
             
         except Exception as e:
@@ -171,10 +200,10 @@ class SnifferTUI(App):
         if ip in self.seen_ips:
             label = self.seen_ips[ip]["widget"]
             label.update(f"IP: {ip} [bold {color}](LISTO)[/]")
-            self.log_widget.write(f"[{color}]AUDITORIA COMPLETADA: {ip}[/]")
+            self.log_widget.write(f"[{color}]AUDITORIA NMAP FINALIZADA: {ip}[/]")
 
 if __name__ == "__main__":
     if os.name != 'nt' and os.getuid() != 0:
-        print("ERROR: Debe ejecutar con privilegios de root (sudo).")
+        print("ERROR: Ejecute con sudo.")
         sys.exit(1)
     SnifferTUI().run()
