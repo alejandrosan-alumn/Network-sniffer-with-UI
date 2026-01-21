@@ -43,7 +43,7 @@ def install_dependencies():
 
 def launch():
     clear_screen()
-    print("🚀 Iniciando Sniffer TUI...")
+    print("Iniciando Sniffer TUI...")
     try:
         from sniffer_tui import SnifferTUI
         app = SnifferTUI()
