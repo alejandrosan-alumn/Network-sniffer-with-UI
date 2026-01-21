@@ -1,0 +1,18 @@
+# Entorno Virtual
+venv/
+.venv/
+env/
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Carpeta de Exportación (Resultados del Sniffer)
+Usuarios_capturados/
+
+# IDEs y logs del sistema
+.vscode/
+.idea/
+.DS_Store
+*.log
