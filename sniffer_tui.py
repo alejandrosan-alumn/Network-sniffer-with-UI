@@ -2,6 +2,7 @@ import os
 import sys
 import threading
 import subprocess
+import socket
 from datetime import datetime
 
 # --- AUTO-INSTALACION DE DEPENDENCIAS ---
@@ -20,7 +21,7 @@ from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, RichLog, Label, Button, ListItem, ListView
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from scapy.all import sniff, IP, Ether, TCP, UDP, ICMP
+from scapy.all import sniff, IP, TCP, UDP, ICMP, DNS
 
 # --- VENTANA EMERGENTE PARA DETALLES ---
 class DetalleIPScreen(ModalScreen):
@@ -31,7 +32,7 @@ class DetalleIPScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="modal_container"):
-            yield Label(f"ANALISIS DE SEGURIDAD: {self.ip}", id="modal_title")
+            yield Label(f"AUDITORIA: {self.ip}", id="modal_title")
             yield RichLog(id="modal_log", markup=True, highlight=True)
             yield Button("CERRAR", variant="error", id="close_btn")
 
@@ -64,7 +65,16 @@ class SnifferTUI(App):
     ListItem { padding: 0 1; height: auto; }
     """
 
-    BINDINGS = [("q", "quit", "Salir")]
+    BINDINGS = [("q", "quit", "Salir"), ("e", "export", "Exportar")]
+
+    def get_local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except: return "127.0.0.1"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -75,7 +85,7 @@ class SnifferTUI(App):
                 yield Label(" DISPOSITIVOS (Click) ", classes="title")
                 yield ListView(id="device_list")
             with Vertical(id="main_content"):
-                yield Label(" IDS & MONITOR DE ACTIVIDAD ", classes="title")
+                yield Label(" IDS Y MONITOR DE ACTIVIDAD ", classes="title")
                 yield RichLog(id="event_log", highlight=True, markup=True)
                 with Horizontal(id="controls"):
                     yield Button("START", id="start", variant="success")
@@ -86,14 +96,15 @@ class SnifferTUI(App):
     def on_mount(self) -> None:
         self.sniffer_activo = False 
         self.seen_ips = {}
+        self.active_connections = set()
         self.selected_interface = None
-        self.connection_attempts = {} # Para el IDS
+        self.connection_attempts = {}
+        self.mi_ip = self.get_local_ip()
+        self.log_widget = self.query_one("#event_log")
         
         iface_list = self.query_one("#iface_list")
         for iface in psutil.net_if_addrs().keys():
             iface_list.append(ListItem(Label(f"IFACE: {iface}"), id=iface))
-        
-        self.log_widget = self.query_one("#event_log")
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id == "iface_list":
@@ -104,103 +115,107 @@ class SnifferTUI(App):
                 if data["widget"] == event.item.children[0]:
                     target_ip = ip
                     break
-            
             if target_ip:
-                info = self.seen_ips[target_ip].get("nmap", "Analisis en curso...")
+                info = self.seen_ips[target_ip].get("nmap", "Analizando...")
                 self.push_screen(DetalleIPScreen(target_ip, info))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "start" and self.selected_interface:
             if not self.sniffer_activo:
                 self.sniffer_activo = True
-                self.log_widget.write("[bold green]SISTEMA DE MONITOREO E IDS ACTIVADO[/bold green]")
+                self.log_widget.write("[bold green]INFO: MONITOR ACTIVADO[/]")
+                if self.mi_ip not in self.seen_ips:
+                    self.registrar_dispositivo(self.mi_ip, es_mio=True)
                 threading.Thread(target=self.run_sniffer, daemon=True).start()
         elif event.button.id == "stop":
             self.sniffer_activo = False
-            self.log_widget.write("[bold yellow]STOP: SISTEMA DETENIDO[/bold yellow]")
+            self.log_widget.write("[bold yellow]INFO: MONITOR DETENIDO[/]")
+        elif event.button.id == "export":
+            self.action_export_full_report()
+
+    def registrar_dispositivo(self, ip, es_mio=False):
+        status = "(LOCAL)" if es_mio else "(NUEVO)"
+        nuevo_label = Label(f"IP: {ip} [bold yellow]{status}[/]")
+        self.seen_ips[ip] = {"nmap": "Pendiente de analisis...", "widget": nuevo_label}
+        
+        list_view = self.query_one("#device_list")
+        if threading.current_thread() is threading.main_thread():
+            list_view.append(ListItem(nuevo_label))
+        else:
+            self.call_from_thread(list_view.append, ListItem(nuevo_label))
+            
+        threading.Thread(target=self.scan_ports_background, args=(ip,), daemon=True).start()
 
     def run_sniffer(self):
         def packet_callback(pkt):
             if not self.sniffer_activo: return True 
-            
             if IP in pkt:
-                ip_src = pkt[IP].src
-                ip_dst = pkt[IP].dst
+                ip_src, ip_dst = pkt[IP].src, pkt[IP].dst
                 
-                # --- 1. DESCUBRIMIENTO DE DISPOSITIVOS ---
                 if ip_src not in self.seen_ips:
-                    nuevo_label = Label(f"IP: {ip_src} [bold yellow](...)[/]")
-                    self.seen_ips[ip_src] = {"nmap": "Ejecutando analisis Nmap...", "widget": nuevo_label}
-                    self.call_from_thread(self.add_device_to_list, nuevo_label)
-                    threading.Thread(target=self.scan_ports_background, args=(ip_src,), daemon=True).start()
+                    self.registrar_dispositivo(ip_src)
 
-                # --- 2. MONITOR DE ACTIVIDAD GENERAL (Flujo constante) ---
-                proto_name = "IP"
-                if pkt.haslayer(TCP): proto_name = "TCP"
-                elif pkt.haslayer(UDP): proto_name = "UDP"
-                elif pkt.haslayer(ICMP): proto_name = "ICMP"
-                
-                msg = f"[{proto_name}] {ip_src} -> {ip_dst}"
+                msg = None
+                conn_id = tuple(sorted((ip_src, ip_dst)))
 
-                # --- 3. RESALTADO DE SEGURIDAD (IDS & Eventos Críticos) ---
-                # Detección de Handshake TCP
+                # Conexiones TCP nuevas
                 if pkt.haslayer(TCP) and pkt[TCP].flags == "S":
-                    msg = f"[bold cyan][CONEXIÓN][/] {ip_src} solicita puerto {pkt[TCP].dport}"
-                
-                # Detección de DNS
-                elif pkt.haslayer(UDP) and pkt[UDP].dport == 53:
-                    msg = f"[bold magenta][DNS][/] {ip_src} buscando resolución de nombre"
+                    if conn_id not in self.active_connections:
+                        msg = f"[cyan]CONN:[/] {ip_src} -> {ip_dst} (Port {pkt[TCP].dport})"
+                        self.active_connections.add(conn_id)
 
-                # Lógica IDS: Detección de Escaneo de Puertos
-                if pkt.haslayer(TCP) or pkt.haslayer(UDP):
+                # Consultas DNS
+                elif pkt.haslayer(DNS) and pkt[DNS].qr == 0:
+                    try:
+                        qname = pkt[DNS].qd.qname.decode()
+                        msg = f"[magenta]DNS:[/] {ip_src} solicita {qname}"
+                    except: pass
+
+                # ICMP (Ping)
+                elif pkt.haslayer(ICMP):
+                    msg = f"[blue]ICMP:[/] {ip_src} -> {ip_dst}"
+
+                # Deteccion de Escaneo (IDS)
+                if (pkt.haslayer(TCP) or pkt.haslayer(UDP)) and ip_src != self.mi_ip:
                     dport = pkt[TCP].dport if pkt.haslayer(TCP) else pkt[UDP].dport
-                    if ip_src not in self.connection_attempts:
-                        self.connection_attempts[ip_src] = set()
-                    
+                    if ip_src not in self.connection_attempts: self.connection_attempts[ip_src] = set()
                     self.connection_attempts[ip_src].add(dport)
                     
                     if len(self.connection_attempts[ip_src]) > 15:
-                        msg = f"[bold red blink][ALERTA IDS][/] ESCANEO DE PUERTOS detectado desde {ip_src}!"
+                        msg = f"[bold red]ALERTA IDS: Escaneo de puertos desde {ip_src}[/]"
 
-                # Enviar al log de la interfaz
                 if msg:
                     self.call_from_thread(self.log_widget.write, msg)
 
         sniff(iface=self.selected_interface, prn=packet_callback, store=0, stop_filter=lambda x: not self.sniffer_activo)
 
-    def add_device_to_list(self, label_widget: Label):
-        self.query_one("#device_list").append(ListItem(label_widget))
-
     def scan_ports_background(self, ip: str):
         try:
-            puertos = "21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1723,3306,3389,5900,8080"
+            puertos = "21,22,23,25,53,80,110,111,135,139,143,443,445,3389,8080"
             cmd = ["nmap", "-sV", "-O", "-p", puertos, "--open", ip]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=80)
-            
-            os_info = "desconocido"
-            for line in res.stdout.splitlines():
-                if "OS details" in line:
-                    os_info = line.split(":")[1].strip().lower()
-                    break
-            
-            color = "white"
-            if "windows" in os_info: color = "dodger_blue"
-            elif "linux" in os_info: color = "red"
-            elif "apple" in os_info: color = "yellow"
-            elif "android" in os_info: color = "green"
-
-            self.seen_ips[ip]["nmap"] = f"[bold {color}]REPORTE DE SEGURIDAD - {ip}[/]\n\n{res.stdout}"
-            self.call_from_thread(self.update_ui_finished, ip, color)
-            
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=95)
+            self.seen_ips[ip]["nmap"] = f"[bold cyan]AUDITORIA NMAP - {ip}[/]\n\n{res.stdout}"
+            self.call_from_thread(self.update_ui_finished, ip)
         except Exception as e:
             self.seen_ips[ip]["nmap"] = f"Error: {e}"
-            self.call_from_thread(self.update_ui_finished, ip, "red")
 
-    def update_ui_finished(self, ip, color):
+    def update_ui_finished(self, ip):
         if ip in self.seen_ips:
             label = self.seen_ips[ip]["widget"]
-            label.update(f"IP: {ip} [bold {color}](LISTO)[/]")
-            self.log_widget.write(f"[{color}]AUDITORIA NMAP FINALIZADA: {ip}[/]")
+            label.update(f"IP: {ip} [bold green](LISTO)[/]")
+
+    def action_export_full_report(self):
+        folder = "Auditorias_Red"
+        if not os.path.exists(folder): os.makedirs(folder)
+        filename = f"Reporte_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        path = os.path.join(folder, filename)
+        
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"REPORTE DE AUDITORIA - {datetime.now()}\n" + "="*40 + "\n")
+            for ip, data in self.seen_ips.items():
+                f.write(f"\nHOST: {ip}\n{data['nmap']}\n")
+        
+        self.log_widget.write(f"[bold green]REPORTE GENERADO EN:[/] {path}")
 
 if __name__ == "__main__":
     if os.name != 'nt' and os.getuid() != 0:

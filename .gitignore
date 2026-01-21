@@ -16,3 +16,7 @@ Usuarios_capturados/
 .idea/
 .DS_Store
 *.log
+Auditorias_Red/Reporte_20260121_180700.txt
+# Reportes de Auditoría de Red
+Auditorias_Red/
+*.txt
