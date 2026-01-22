@@ -3,6 +3,7 @@ import sys
 import threading
 import subprocess
 import socket
+import ipaddress
 from datetime import datetime
 
 # --- AUTO-INSTALACIÓN DE DEPENDENCIAS ---
@@ -100,17 +101,24 @@ class SnifferTUI(App):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
         except: return "127.0.0.1"
 
+    def es_ip_privada(self, ip):
+        try:
+            addr = ipaddress.ip_address(ip)
+            return addr.is_private or addr.is_loopback
+        except: return False
+
     def seguro_update(self, func, *args):
-        """Evita el RuntimeError detectando si estamos en el hilo principal o no"""
         if threading.current_thread() is threading.main_thread():
             func(*args)
         else:
             self.call_from_thread(func, *args)
 
-    def registrar_evento(self, key, msg_base, categoria_color, ip_src):
+    def registrar_evento(self, key, msg_base, categoria_color, ip_relacionada):
         log_widget = self.query_one("#event_log")
         if key not in self.event_counters:
             self.event_counters[key] = 1
@@ -121,49 +129,67 @@ class SnifferTUI(App):
                 count = self.event_counters[key]
                 self.seguro_update(log_widget.write, f"[bold yellow]ACTUALIZACIÓN:[/] [{categoria_color}]{msg_base}[/] ({count} eventos)")
 
-        if ip_src in self.seen_ips:
+        if ip_relacionada in self.seen_ips:
             hora = datetime.now().strftime('%H:%M:%S')
-            self.seen_ips[ip_src]["historial"].append(f"[{hora}] {msg_base}")
+            self.seen_ips[ip_relacionada]["historial"].append(f"[{hora}] {msg_base}")
 
     def run_sniffer(self):
         def packet_callback(pkt):
             if not self.sniffer_activo or IP not in pkt: return
             src, dst = pkt[IP].src, pkt[IP].dst
+            
             if src not in self.seen_ips: self.registrar_dispositivo(src)
+            if dst not in self.seen_ips: self.registrar_dispositivo(dst)
 
-            if pkt.haslayer(TCP) and pkt[TCP].flags == "S":
-                key = f"tcp_{src}_{dst}_{pkt[TCP].dport}"
-                self.registrar_evento(key, f"TCP: {src} -> {dst}:{pkt[TCP].dport}", "cyan", src)
-            elif pkt.haslayer(DNS) and pkt[DNS].qr == 0:
+            if pkt.haslayer(DNS) and pkt[DNS].qr == 0:
                 try:
                     qname = pkt[DNS].qd.qname.decode()
-                    key = f"dns_{src}_{qname}"
-                    self.registrar_evento(key, f"DNS: {src} busca {qname}", "magenta", src)
+                    self.registrar_evento(f"dns_{src}_{qname}", f"DNS: {src} busca {qname}", "magenta", src)
                 except: pass
+            elif pkt.haslayer(TCP) and pkt[TCP].flags == "S":
+                self.registrar_evento(f"tcp_{src}_{dst}_{pkt[TCP].dport}", f"TCP: {src} -> {dst}:{pkt[TCP].dport}", "cyan", src)
+            elif pkt.haslayer(ICMP):
+                self.registrar_evento(f"icmp_{src}_{dst}", f"ICMP: {src} -> {dst} (Ping)", "yellow", src)
 
-            if src != self.mi_ip:
+            # IDS
+            if src != self.mi_ip and self.es_ip_privada(src):
                 if src not in self.connection_attempts: self.connection_attempts[src] = set()
                 if TCP in pkt: self.connection_attempts[src].add(pkt[TCP].dport)
                 if len(self.connection_attempts[src]) > 15:
-                    key_ids = f"ids_{src}"
-                    self.registrar_evento(key_ids, f"ALERTA IDS: Escaneo desde {src}", "bold red", src)
+                    self.registrar_evento(f"ids_{src}", f"ALERTA IDS: Escaneo desde {src}", "bold red", src)
 
         sniff(iface=self.selected_interface, prn=packet_callback, store=0, stop_filter=lambda x: not self.sniffer_activo)
 
     def registrar_dispositivo(self, ip, es_mio=False):
-        status = "(LOCAL)" if es_mio else "(NUEVO)"
-        lbl = Label(f"IP: {ip} [yellow]{status}[/]")
-        self.seen_ips[ip] = {"nmap": "Pendiente de análisis...", "widget": lbl, "historial": []}
+        if ip in self.seen_ips: return
+        
+        privada = self.es_ip_privada(ip)
+        tag = "(LOCAL)" if es_mio else ("(INTERNO)" if privada else "(EXTERNO)")
+        
+        # Ahora permitimos el escaneo si es privada, INCLUYENDO la nuestra
+        status_nmap = "(ESCANEANDO...)" if privada else "Listo"
+        info_nmap = "Analizando puertos..." if privada else "Análisis omitido (IP Externa)"
+        
+        lbl = Label(f"IP: {ip} [yellow]{tag}[/] [green]{status_nmap}[/]")
+        self.seen_ips[ip] = {"nmap": info_nmap, "widget": lbl, "historial": []}
         lv = self.query_one("#device_list")
         self.seguro_update(lv.append, ListItem(lbl))
-        threading.Thread(target=self.scan, args=(ip,), daemon=True).start()
+        
+        if privada:
+            threading.Thread(target=self.scan, args=(ip,), daemon=True).start()
 
     def scan(self, ip):
         try:
-            res = subprocess.run(["nmap", "-sV", "-p", "22,80,443,445", "--open", ip], capture_output=True, text=True, timeout=50)
-            self.seen_ips[ip]["nmap"] = res.stdout if res.stdout else "No se detectaron puertos abiertos."
-            self.seguro_update(self.seen_ips[ip]["widget"].update, f"IP: {ip} [bold green](LISTO)[/]")
-        except: pass
+            # -T4 y -F para velocidad. Si es nuestra IP local, suele ser casi instantáneo.
+            res = subprocess.run(["nmap", "-sV", "-T4", "-F", ip], capture_output=True, text=True, timeout=30)
+            self.seen_ips[ip]["nmap"] = res.stdout if res.stdout else "No se detectaron servicios abiertos."
+            
+            # Recuperar el tag para actualizar el label correctamente
+            es_mio = (ip == self.mi_ip)
+            tag = "(LOCAL)" if es_mio else ("(INTERNO)" if self.es_ip_privada(ip) else "(EXTERNO)")
+            self.seguro_update(self.seen_ips[ip]["widget"].update, f"IP: {ip} [yellow]{tag}[/] [bold green](LISTO)[/]")
+        except:
+            self.seen_ips[ip]["nmap"] = "Error en el escaneo."
 
     def start_sniffer(self):
         if not self.selected_interface:
@@ -172,7 +198,10 @@ class SnifferTUI(App):
         if not self.sniffer_activo:
             self.sniffer_activo = True
             self.query_one("#event_log").write("[bold green]START: MONITOREO ACTIVADO[/]")
-            if self.mi_ip not in self.seen_ips: self.registrar_dispositivo(self.mi_ip, True)
+            
+            # Forzamos el registro y escaneo de nuestra propia IP al inicio
+            self.registrar_dispositivo(self.mi_ip, True)
+            
             threading.Thread(target=self.run_sniffer, daemon=True).start()
 
     def stop_sniffer(self):
@@ -189,7 +218,6 @@ class SnifferTUI(App):
                 f.write(f"HOST: {ip}\n{d['nmap']}\n" + "-"*30 + "\n")
         self.query_one("#event_log").write(f"[bold green]INFORME EXPORTADO:[/] {path}")
 
-    # --- EVENTOS DE INTERFAZ ---
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id == "iface_list":
             self.selected_interface = event.item.id
