@@ -1,59 +1,46 @@
 # Network Sniffer TUI
 
-Una herramienta de auditoría de red con interfaz de terminal (TUI) desarrollada en Python. Diseñada para monitorear tráfico en tiempo real, detectar comportamientos anómalos y realizar escaneos automáticos de servicios sin saturar la pantalla.
+Herramienta profesional de auditoria de red con interfaz de terminal (TUI). Diseñada para el monitoreo selectivo y la intercepción manual de trafico local mediante tecnicas MitM de alto rendimiento.
 
-## Características Avanzadas
+## Caracteristicas Avanzadas
 
-* **Log Colapsado Inteligente:** Evita el ruido visual agrupando eventos repetitivos (DNS, TCP, ICMP) en una sola línea con un contador dinámico que se actualiza en tiempo real.
-* **Sistema de Alertas IDS:** Identificación automática de escaneos de puertos y actividades sospechosas con alertas visuales resaltadas.
-* **Historial por Dispositivo:** Al hacer clic en cualquier IP detectada, se despliega una ventana modal con el historial completo de su actividad y su auditoría de servicios técnica.
-* **Escaneo Automático Nmap:** Ejecución de escaneos de servicios (-sV) en segundo plano para cada nuevo dispositivo identificado en la red.
-* **Exportación de Informes:** Generación de reportes detallados en la carpeta Auditorias_Red, organizados por fecha y hora.
+* Intercepcion Manual Selectiva: El usuario fija el objetivo con un clic, iniciando el envenenamiento ARP de forma dirigida.
+* Optimizacion Automatica: El lanzador activa el IP Forwarding del Kernel (en Linux) para garantizar una navegacion fluida en el dispositivo auditado.
+* Log Inteligente: Agrupacion de eventos (DNS, TCP, ICMP) para evitar el lag visual y facilitar el analisis.
+* Autodescubrimiento de Gateway: Identificacion automatica de la ruta de salida a internet para el ataque Man-in-the-Middle.
+* Restauracion de Red: Al detener la auditoria o cambiar de objetivo, la herramienta envia paquetes ARP legitimos para devolver la estabilidad a los dispositivos.
 
 ---
 
-## Instalación y Uso Universal
+## Instalacion y Requisitos
 
-Esta herramienta utiliza un script de gestión centralizado (main.py) que verifica requisitos, instala dependencias faltantes y lanza la aplicación automáticamente.
+### Linux (Parrot, Kali, Ubuntu)
+1. Requisito: Instalacion de Nmap (sudo apt install nmap).
+2. Ejecucion: sudo python3 main.py (El script activara automaticamente el ip_forward).
 
-### Preparación en Linux
-1. Requisito: Tener nmap instalado (sudo apt install nmap).
-2. Ejecución:
-   ```bash
-   sudo python3 main.py
+### Windows
+1. Requisito: Nmap configurado en el PATH y Npcap en modo compatibilidad WinPcap.
+2. Ejecucion: Abrir terminal como Administrador y lanzar python main.py.
 
-### Preparación en Windows
-1. Requisito Nmap: Instalar Nmap y asegurarse de que esté en el PATH del sistema.
-2. Requisito Npcap: Instalar Npcap marcando obligatoriamente la opción "Install Npcap in WinPcap API-compatible Mode".
-3. Ejecución: Abre una terminal (CMD o PowerShell) como Administrador y ejecuta:
-   ```bash
-   python main.py
+---
 
-## Atajos de Teclado (Bindings)
+## Detalles del Analisis
 
-La interfaz incluye un footer dinámico para facilitar la navegación:
+* Man-in-the-Middle: Posicionamiento entre el Router y el Objetivo para visualizar dominios visitados (DNS) a pesar del cifrado HTTPS.
+* Auditoria Nmap: Obtencion de puertos, servicios y versiones del sistema operativo del host seleccionado.
+* Rendimiento: Uso de hilos (threading) independientes para la interfaz, el sniffer y el ataque ARP.
 
-| Tecla | Acción |
+---
+
+## Atajos de Teclado
+
+| Tecla | Accion |
 | :--- | :--- |
-| **S** | **Iniciar / Detener** el monitoreo de red. |
-| **E** | **Exportar** el informe actual a la carpeta `Auditorias_Red/`. |
-| **Q** | **Salir** de la aplicación de forma segura. |
-| **ESC** | **Cerrar** ventanas modales de detalles de IP. |
+| S | Iniciar / Detener el Sniffer y la Intercepcion |
+| E | Exportar el informe de auditoria actual |
+| Q | Salir de la aplicacion de forma segura |
+| ESC | Cerrar ventanas modales o liberar objetivos |
 
 ---
 
-## Requisitos Técnicos
-
-* **Python 3.10+**
-* **Librerías principales:** `textual`, `scapy`, `psutil` (Gestionadas automáticamente por los lanzadores).
-* **Controlador de Red:** Npcap (Windows) o privilegios de Root (Linux).
-
-## Estructura del Proyecto
-
-* `main.py`: Launcher con autodetección de dependencias y permisos.
-* `sniffer_tui.py`: Código principal y lógica de la interfaz.
-* `requirements.txt`: Lista de dependencias de Python.
-* `Auditorias_Red/`: Carpeta autogenerada para los reportes de salida.
-
----
-> **Aviso Legal:** Esta herramienta ha sido creada con fines de auditoría ética y aprendizaje. El uso de este software en redes sin autorización previa es responsabilidad exclusiva del usuario.
+Aviso Legal: Herramienta de uso educativo y profesional. El uso de estas tecnicas en redes ajenas sin autorizacion es ilegal.

